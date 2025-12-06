@@ -18,6 +18,7 @@ A Retail Sales Management System built with FastAPI and Next.js that provides co
 - TypeScript
 - Tailwind CSS (styling)
 - Axios (HTTP client)
+- Clerk (authentication)
 
 **Data Storage:**
 - CSV file (loaded into memory at startup)
@@ -38,6 +39,10 @@ Sorting supports three fields: Date (newest/oldest first), Quantity (high to low
 
 Pagination is implemented with a configurable page size (default: 10 items per page). The backend calculates skip value as `(page - 1) * page_size` and uses Pandas `.iloc[]` slicing for efficient data retrieval. Total count is calculated from the filtered dataset before pagination to provide accurate pagination metadata. The frontend displays page numbers with ellipsis for large page counts, Previous/Next navigation buttons, and highlights the current page. Page state automatically resets to 1 when filters or search change, and the system handles edge cases where the current page exceeds total pages after filtering. All state (search, filters, sort) is preserved during page navigation.
 
+## Authentication Implementation Summary
+
+Authentication is implemented using Clerk, a modern authentication service. The application uses Clerk's Next.js integration with middleware-based route protection. All routes except sign-in and sign-up pages are protected and require authentication. The middleware automatically redirects unauthenticated users to the sign-in page. User authentication state is managed by Clerk, and a user profile button is displayed in the application header for easy access to account settings and sign-out functionality. Clerk handles user sessions, password management, and social authentication options.
+
 ## Setup Instructions
 
 ### Prerequisites
@@ -57,8 +62,10 @@ cd backend
 pip install -r requirements.txt
 ```
 
-3. Ensure the CSV file is in the project root:
-   - Place `truestate_assignment_dataset.csv` in the root directory (`/assessment/`)
+3. Set up the CSV file (choose one):
+   - **Option A (Development)**: Place `truestate_assignment_dataset.csv` in the root directory (`/assessment/`)
+   - **Option B (Environment Variable)**: Set `CSV_PATH` environment variable to the CSV file path
+   - **Option C (Cloud Storage)**: Set `CSV_PATH` to a URL (http:// or https://) pointing to the CSV file
 
 4. Start the FastAPI server:
 ```bash
@@ -82,10 +89,21 @@ cd frontend
 npm install
 ```
 
-3. Create `.env.local` file (if needed):
+3. Create `.env.local` file with Clerk credentials:
 ```bash
 NEXT_PUBLIC_API_URL=http://localhost:8000
+NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
+CLERK_SECRET_KEY=sk_test_...
+NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
+NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
+NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL=/
+NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL=/
 ```
+
+   To get your Clerk keys:
+   1. Sign up at https://clerk.com
+   2. Create a new application
+   3. Copy the publishable key and secret key from the dashboard
 
 4. Start the development server:
 ```bash
@@ -111,7 +129,23 @@ npm run dev
 ### Environment Variables
 
 **Backend (.env):**
+- `CSV_PATH` - Path to CSV file or URL (default: `../truestate_assignment_dataset.csv`)
 - `CORS_ORIGINS` - Comma-separated list of allowed origins (default: `http://localhost:3000`)
 
 **Frontend (.env.local):**
 - `NEXT_PUBLIC_API_URL` - Backend API URL (default: `http://localhost:8000`)
+- `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` - Clerk publishable key (required)
+- `CLERK_SECRET_KEY` - Clerk secret key (required)
+- `NEXT_PUBLIC_CLERK_SIGN_IN_URL` - Sign-in page URL (default: `/sign-in`)
+- `NEXT_PUBLIC_CLERK_SIGN_UP_URL` - Sign-up page URL (default: `/sign-up`)
+- `NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL` - Redirect after sign-in (default: `/`)
+- `NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL` - Redirect after sign-up (default: `/`)
+
+## Deployment
+
+For deployment instructions without committing the CSV to GitHub, see [backend/DEPLOYMENT.md](backend/DEPLOYMENT.md).
+
+The backend supports loading CSV from:
+- Local file path (via `CSV_PATH` environment variable)
+- Cloud storage URLs (S3, Google Cloud Storage, Azure Blob, etc.)
+- Docker volume mounts
