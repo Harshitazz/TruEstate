@@ -9,4 +9,6 @@ __pycache__/
 venv/
 dist/
 build/
+*.csv
+truestate_assignment_dataset.csv
 
