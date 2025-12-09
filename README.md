@@ -1,6 +1,7 @@
 # Sales Management System
 
-## Overview
+## Overview[screen-capture (2).webm](https://github.com/user-attachments/assets/5ac05c0c-0663-4272-9185-ac0afb0ce324)
+
 
 A Retail Sales Management System built with FastAPI and Next.js that provides comprehensive search, filtering, sorting, and pagination capabilities for sales transaction data. The system efficiently handles large datasets stored in CSV format, loaded into memory using Pandas for fast data processing. The application features an intuitive user interface with real-time search, multi-select filters, and robust error handling for edge cases.
 
