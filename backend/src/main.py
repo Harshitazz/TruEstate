@@ -32,7 +32,7 @@ app.include_router(sales.router)
 async def startup_event():
     try:
         await connect_to_mongo()
-        logger.info("Application startup complete - CSV data loaded into memory")
+        logger.info("Application startup complete - MongoDB connected")
     except Exception as e:
         logger.error(f"Failed to start application: {str(e)}", exc_info=True)
         raise

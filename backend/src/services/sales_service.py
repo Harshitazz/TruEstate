@@ -1,19 +1,17 @@
 from typing import Optional, List
-import pandas as pd
-import numpy as np
 import re
-from src.config.database import database
-from src.models.sales import SalesTransaction, SummaryStats
 import math
+from pymongo.collection import Collection
+from pymongo import ASCENDING, DESCENDING
+from src.config.database import get_collection
+from src.models.sales import SalesTransaction, SummaryStats
 import logging
 
 logger = logging.getLogger(__name__)
 
 class SalesService:
     def __init__(self):
-        if database.df is None:
-            raise ValueError("Data not loaded. Make sure CSV data is loaded.")
-        self.df: pd.DataFrame = database.df.copy(deep=True)
+        self.collection: Collection = get_collection()
 
     def _normalize_string_list(self, value_list: Optional[List[str]], to_lowercase: bool = True) -> Optional[List[str]]:
         """Normalize string list by stripping whitespace, converting to lowercase, and filtering empty values"""
@@ -59,9 +57,8 @@ class SalesService:
                     raise
                 raise ValueError(f"Invalid date format. Expected YYYY-MM-DD format.")
 
-    def _apply_filters(
+    def _build_query(
         self,
-        df: pd.DataFrame,
         search: Optional[str] = None,
         customer_regions: Optional[List[str]] = None,
         genders: Optional[List[str]] = None,
@@ -72,147 +69,125 @@ class SalesService:
         payment_methods: Optional[List[str]] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
-    ) -> pd.DataFrame:
-        """Apply all filters to the dataframe"""
+    ) -> dict:
+        """Build MongoDB query from filters"""
         self._validate_filters(age_min=age_min, age_max=age_max, date_from=date_from, date_to=date_to)
         
-        filtered_df = df.copy(deep=True)
+        query = {}
         
         if search and search.strip():
             search_term = search.strip()
             search_lower = search_term.lower()
             search_digits = ''.join(filter(str.isdigit, search_term))
             
-            mask = pd.Series([False] * len(filtered_df), index=filtered_df.index)
+            search_conditions = []
             
             text_fields = [
-                'customer_name',
-                'product_name',
-                'employee_name',
-                'store_location',
-                'brand',
-                'customer_type',
-                'order_status',
-                'delivery_type'
+                'customer_name', 'product_name', 'employee_name', 'store_location',
+                'brand', 'customer_type', 'order_status', 'delivery_type'
             ]
-            
             for field in text_fields:
-                if field in filtered_df.columns:
-                    field_data = filtered_df[field].fillna('').astype(str)
-                    mask |= field_data.str.lower().str.contains(search_lower, na=False, regex=False)
+                search_conditions.append({field: {'$regex': re.escape(search_lower), '$options': 'i'}})
             
-            id_fields = [
-                'customer_id',
-                'product_id',
-                'store_id',
-                'salesperson_id'
-            ]
-            
+            id_fields = ['customer_id', 'product_id', 'store_id', 'salesperson_id']
             for field in id_fields:
-                if field in filtered_df.columns:
-                    field_data = filtered_df[field].fillna('').astype(str)
-                    mask |= field_data.str.lower().str.contains(search_lower, na=False, regex=False)
+                search_conditions.append({field: {'$regex': re.escape(search_lower), '$options': 'i'}})
             
-            if 'transaction_id' in filtered_df.columns and search_digits:
-                transaction_data = filtered_df['transaction_id'].fillna(0).astype(str)
-                mask |= transaction_data.str.contains(search_digits, na=False, regex=False)
+            if search_digits:
+                try:
+                    transaction_id = int(search_digits)
+                    search_conditions.append({'transaction_id': transaction_id})
+                except ValueError:
+                    pass
             
-            if 'phone_number' in filtered_df.columns and search_digits:
-                phone_data = filtered_df['phone_number'].fillna('').astype(str)
-                mask |= phone_data.str.contains(search_digits, na=False, regex=False)
-                phone_clean = phone_data.str.replace(r'[^\d]', '', regex=True)
-                mask |= phone_clean.str.contains(search_digits, na=False, regex=False)
+            if search_digits:
+                search_conditions.append({'phone_number': {'$regex': re.escape(search_digits), '$options': 'i'}})
             
-            filtered_df = filtered_df[mask].copy()
-            filtered_df.reset_index(drop=True, inplace=True)
-            
-            logger.info(f"Search '{search_term}' found {len(filtered_df)} results across multiple fields")
+            if search_conditions:
+                query['$or'] = search_conditions
         
         customer_regions = self._normalize_string_list(customer_regions, to_lowercase=True)
         if customer_regions:
-            region_set = set(customer_regions)
-            if 'customer_region' in filtered_df.columns:
-                region_data = filtered_df['customer_region'].fillna('')
-                region_mask = region_data.isin(region_set)
-                filtered_df = filtered_df[region_mask].copy()
-                filtered_df.reset_index(drop=True, inplace=True)
+            query['customer_region'] = {'$in': customer_regions}
         
         genders = self._normalize_string_list(genders, to_lowercase=True)
         if genders:
-            gender_set = set(genders)
-            if 'gender' in filtered_df.columns:
-                gender_data = filtered_df['gender'].fillna('')
-                gender_mask = gender_data.isin(gender_set)
-                filtered_df = filtered_df[gender_mask].copy()
-                filtered_df.reset_index(drop=True, inplace=True)
-            logger.info(f"Gender filter applied: {genders}, filtered to {len(filtered_df)} records from {len(df)}")
-            unique_genders = filtered_df['gender'].unique()
-            logger.debug(f"Unique genders after filter: {unique_genders.tolist()}")
+            query['gender'] = {'$in': genders}
         
-        if age_min is not None:
-            if 'age' in filtered_df.columns:
-                age_data = pd.to_numeric(filtered_df['age'], errors='coerce').fillna(0)
-                filtered_df = filtered_df[age_data >= age_min].copy()
-        if age_max is not None:
-            if 'age' in filtered_df.columns:
-                age_data = pd.to_numeric(filtered_df['age'], errors='coerce').fillna(0)
-                filtered_df = filtered_df[age_data <= age_max].copy()
+        if age_min is not None or age_max is not None:
+            age_query = {}
+            if age_min is not None:
+                age_query['$gte'] = age_min
+            if age_max is not None:
+                age_query['$lte'] = age_max
+            query['age'] = age_query
         
         product_categories = self._normalize_string_list(product_categories, to_lowercase=True)
         if product_categories:
-            category_set = set(product_categories)
-            if 'product_category' in filtered_df.columns:
-                category_data = filtered_df['product_category'].fillna('')
-                category_mask = category_data.isin(category_set)
-                filtered_df = filtered_df[category_mask].copy()
-                filtered_df.reset_index(drop=True, inplace=True)
+            query['product_category'] = {'$in': product_categories}
         
         tags = self._normalize_string_list(tags, to_lowercase=True)
         if tags:
-            if 'tags' in filtered_df.columns:
-                tag_mask = pd.Series([False] * len(filtered_df), index=filtered_df.index)
-                tags_data = filtered_df['tags'].fillna('').astype(str)
-                for tag in tags:
-                    if tag:
-                        tag_escaped = re.escape(tag)
-                        tag_mask |= tags_data.str.contains(
-                            f'\\b{tag_escaped}\\b', 
-                            case=False, 
-                            na=False, 
-                            regex=True
-                        )
-                filtered_df = filtered_df[tag_mask].copy()
-                filtered_df.reset_index(drop=True, inplace=True)
+            tag_conditions = [{'tags': {'$regex': f'\\b{re.escape(tag)}\\b', '$options': 'i'}} for tag in tags]
+            if '$or' in query:
+                search_or = query.pop('$or')
+                query['$and'] = query.get('$and', []) + [
+                    {'$or': search_or},
+                    {'$or': tag_conditions}
+                ]
+            else:
+                query['$or'] = tag_conditions
         
         payment_methods = self._normalize_string_list(payment_methods, to_lowercase=True)
         if payment_methods:
-            payment_set = set(payment_methods)
-            if 'payment_method' in filtered_df.columns:
-                payment_data = filtered_df['payment_method'].fillna('')
-                payment_mask = payment_data.isin(payment_set)
-                filtered_df = filtered_df[payment_mask].copy()
-                filtered_df.reset_index(drop=True, inplace=True)
-            logger.info(f"Payment method filter applied: {payment_methods}, filtered to {len(filtered_df)} records")
-            if len(filtered_df) > 0:
-                unique_payments = filtered_df['payment_method'].unique()
-                logger.debug(f"Unique payment methods after filter: {unique_payments.tolist()}")
+            query['payment_method'] = {'$in': payment_methods}
         
-        if date_from and date_from.strip():
-            date_from_clean = date_from.strip()
-            if 'date' in filtered_df.columns:
-                date_data = filtered_df['date'].fillna('').astype(str)
-                filtered_df = filtered_df[date_data >= date_from_clean].copy()
-        if date_to and date_to.strip():
-            date_to_clean = date_to.strip()
-            if 'date' in filtered_df.columns:
-                date_data = filtered_df['date'].fillna('').astype(str)
-                filtered_df = filtered_df[date_data <= date_to_clean].copy()
+        if date_from and date_from.strip() or date_to and date_to.strip():
+            date_query = {}
+            if date_from and date_from.strip():
+                date_query['$gte'] = date_from.strip()
+            if date_to and date_to.strip():
+                date_query['$lte'] = date_to.strip()
+            query['date'] = date_query
         
-        if len(filtered_df) == 0:
-            logger.info("No results found after applying filters")
-            return pd.DataFrame(columns=df.columns)
+        return query
+
+    def _build_sort(self, sort_by: str = "date", sort_order: str = "desc") -> List[tuple]:
+        """Build MongoDB sort specification"""
+        sort_field_map = {
+            "date": "date",
+            "quantity": "quantity",
+            "customer_name": "customer_name"
+        }
+        sort_field = sort_field_map.get(sort_by, "date")
+        sort_direction = ASCENDING if sort_order == "asc" else DESCENDING
+        return [(sort_field, sort_direction)]
+
+    def _convert_to_transaction(self, doc: dict) -> SalesTransaction:
+        """Convert MongoDB document to SalesTransaction model"""
+        doc.pop('_id', None)
         
-        return filtered_df
+        def to_title_case(s):
+            if not s:
+                return s
+            s_str = str(s).strip()
+            if not s_str:
+                return s_str
+            return s_str[0].upper() + s_str[1:].lower() if len(s_str) > 1 else s_str.upper()
+        
+        if 'gender' in doc:
+            doc['gender'] = to_title_case(doc['gender'])
+        if 'customer_region' in doc:
+            doc['customer_region'] = to_title_case(doc['customer_region'])
+        if 'product_category' in doc:
+            doc['product_category'] = to_title_case(doc['product_category'])
+        if 'payment_method' in doc:
+            doc['payment_method'] = to_title_case(doc['payment_method'])
+        if 'tags' in doc and doc['tags']:
+            tags_list = [to_title_case(t.strip()) for t in str(doc['tags']).split(',') if t.strip()]
+            doc['tags'] = ','.join(tags_list)
+        
+        return SalesTransaction(**doc)
 
     async def get_transactions(
         self,
@@ -233,11 +208,7 @@ class SalesService:
     ) -> dict:
         """Get transactions with search, filter, sort, and pagination"""
         
-        initial_count = len(self.df)
-        logger.debug(f"Starting with {initial_count} records, filters: genders={genders}")
-        
-        filtered_df = self._apply_filters(
-            self.df,
+        query = self._build_query(
             search=search,
             customer_regions=customer_regions,
             genders=genders,
@@ -250,96 +221,27 @@ class SalesService:
             date_to=date_to
         )
         
-        filtered_count = len(filtered_df)
-        logger.debug(f"After filters: {filtered_count} records (from {initial_count})")
+        sort_spec = self._build_sort(sort_by=sort_by, sort_order=sort_order)
         
-        total = len(filtered_df)
-        
-        sort_field_map = {
-            "date": "date",
-            "quantity": "quantity",
-            "customer_name": "customer_name"
-        }
-        sort_field = sort_field_map.get(sort_by, "date")
-        ascending = sort_order == "asc"
-        
-        logger.info(f"Sorting by: {sort_field}, order: {sort_order} (ascending: {ascending})")
-        
-        if sort_field == "date":
-            filtered_df = filtered_df.sort_values(by=sort_field, ascending=ascending, na_position='last', kind='mergesort')
-        elif sort_field == "quantity":
-            filtered_df = filtered_df.sort_values(by=sort_field, ascending=ascending, na_position='last', kind='mergesort')
-        elif sort_field == "customer_name":
-            filtered_df = filtered_df.copy()
-            filtered_df['_sort_key'] = filtered_df[sort_field].astype(str).str.lower()
-            filtered_df = filtered_df.sort_values(by='_sort_key', ascending=ascending, na_position='last', kind='mergesort')
-            filtered_df = filtered_df.drop(columns=['_sort_key'])
-        else:
-            filtered_df = filtered_df.sort_values(by=sort_field, ascending=ascending, na_position='last', kind='mergesort')
-        
-        filtered_df = filtered_df.reset_index(drop=True)
-        
-        if len(filtered_df) > 0:
-            sample_values = filtered_df[sort_field].head(5).tolist()
-            logger.info(f"After sorting by {sort_field} ({'asc' if ascending else 'desc'}), first 5 values: {sample_values}")
-        else:
-            logger.info(f"After sorting by {sort_field}, no records found")
-        
-        skip = (page - 1) * page_size
+        total = self.collection.count_documents(query)
         total_pages = math.ceil(total / page_size) if total > 0 else 0
         
-        if skip >= total:
-            paginated_df = pd.DataFrame()
-        else:
-            paginated_df = filtered_df.iloc[skip:skip + page_size].copy()
+        skip = (page - 1) * page_size
         
-        if len(paginated_df) > 0:
-            paginated_values = paginated_df[sort_field].head(3).tolist()
-            logger.info(f"Paginated results (page {page}), first 3 {sort_field} values: {paginated_values}")
+        cursor = self.collection.find(query).sort(sort_spec).skip(skip).limit(page_size)
+        documents = list(cursor)
         
-        result = []
-        if genders and len(paginated_df) > 0:
-            unique_genders_in_result = paginated_df['gender'].unique()
-            expected_genders = self._normalize_string_list(genders, to_lowercase=True)
-            if expected_genders:
-                expected_set = set(expected_genders)
-                actual_set = {str(g).lower().strip() for g in unique_genders_in_result}
-                unexpected = actual_set - expected_set
-                if unexpected:
-                    logger.error(f"FILTER ERROR: Found unexpected genders {unexpected} in paginated results! Expected: {expected_set}, Got: {actual_set}")
-                    paginated_df = paginated_df[paginated_df['gender'].isin(expected_set)].copy()
-                    logger.warning(f"Re-filtered paginated results, now have {len(paginated_df)} records")
-        
-        def to_title_case(s):
-            """Convert string to title case for display"""
-            if not s or pd.isna(s):
-                return s
-            s_str = str(s).strip()
-            if not s_str:
-                return s_str
-            return s_str[0].upper() + s_str[1:].lower() if len(s_str) > 1 else s_str.upper()
-        
-        for _, row in paginated_df.iterrows():
+        transactions = []
+        for doc in documents:
             try:
-                transaction_dict = row.to_dict()
-                if 'gender' in transaction_dict:
-                    transaction_dict['gender'] = to_title_case(transaction_dict['gender'])
-                if 'customer_region' in transaction_dict:
-                    transaction_dict['customer_region'] = to_title_case(transaction_dict['customer_region'])
-                if 'product_category' in transaction_dict:
-                    transaction_dict['product_category'] = to_title_case(transaction_dict['product_category'])
-                if 'payment_method' in transaction_dict:
-                    transaction_dict['payment_method'] = to_title_case(transaction_dict['payment_method'])
-                if 'tags' in transaction_dict and transaction_dict['tags']:
-                    tags_list = [to_title_case(t.strip()) for t in str(transaction_dict['tags']).split(',') if t.strip()]
-                    transaction_dict['tags'] = ','.join(tags_list)
-                result.append(SalesTransaction(**transaction_dict))
+                transaction = self._convert_to_transaction(doc)
+                transactions.append(transaction)
             except Exception as e:
-                logger.warning(f"Error converting transaction {transaction_dict.get('transaction_id', 'unknown')}: {str(e)}")
+                logger.warning(f"Error converting document: {str(e)}")
                 continue
         
         return {
-            "transactions": result,
+            "transactions": transactions,
             "total": total,
             "page": page,
             "page_size": page_size,
@@ -360,8 +262,7 @@ class SalesService:
     ) -> SummaryStats:
         """Get summary statistics based on current filters"""
         
-        filtered_df = self._apply_filters(
-            self.df,
+        query = self._build_query(
             customer_regions=customer_regions,
             genders=genders,
             age_min=age_min,
@@ -373,7 +274,22 @@ class SalesService:
             date_to=date_to
         )
         
-        if len(filtered_df) == 0:
+        pipeline = [
+            {'$match': query},
+            {
+                '$group': {
+                    '_id': None,
+                    'total_units_sold': {'$sum': '$quantity'},
+                    'total_amount': {'$sum': '$total_amount'},
+                    'total_final_amount': {'$sum': '$final_amount'},
+                    'total_sales_records': {'$sum': 1}
+                }
+            }
+        ]
+        
+        result = list(self.collection.aggregate(pipeline))
+        
+        if not result:
             return SummaryStats(
                 total_units_sold=0,
                 total_amount=0.0,
@@ -381,61 +297,67 @@ class SalesService:
                 total_sales_records=0
             )
         
-        total_units_sold = int(filtered_df['quantity'].sum())
-        total_amount = float(filtered_df['total_amount'].sum())
-        total_discount = float((filtered_df['total_amount'] - filtered_df['final_amount']).sum())
-        total_sales_records = len(filtered_df)
+        stats = result[0]
+        total_discount = stats['total_amount'] - stats['total_final_amount']
         
         return SummaryStats(
-            total_units_sold=total_units_sold,
-            total_amount=total_amount,
-            total_discount=total_discount,
-            total_sales_records=total_sales_records
-            )
+            total_units_sold=int(stats['total_units_sold']),
+            total_amount=float(stats['total_amount']),
+            total_discount=float(total_discount),
+            total_sales_records=int(stats['total_sales_records'])
+        )
     
     async def get_filter_options(self) -> dict:
         """Get all unique filter options for dropdowns"""
-        df = self.df
-        
-        customer_regions = sorted([
-            str(v).strip() for v in df['customer_region'].dropna().unique() 
-            if pd.notna(v) and str(v).strip()
-        ])
-        
-        genders = sorted([
-            str(v).strip() for v in df['gender'].dropna().unique() 
-            if pd.notna(v) and str(v).strip()
-        ])
-        
-        product_categories = sorted([
-            str(v).strip() for v in df['product_category'].dropna().unique() 
-            if pd.notna(v) and str(v).strip()
-        ])
-        
-        payment_methods = sorted([
-            str(v).strip() for v in df['payment_method'].dropna().unique() 
-            if pd.notna(v) and str(v).strip()
-        ])
-        
-        all_tags = set()
-        for tag_string in df['tags'].dropna():
-            if tag_string and pd.notna(tag_string):
-                tag_list = [t.strip() for t in str(tag_string).split(",") if t.strip()]
-                all_tags.update(tag_list)
         
         def to_title_case(s):
-            """Convert string to title case for display"""
-            if not s or pd.isna(s):
+            if not s:
                 return s
             s_str = str(s).strip()
             if not s_str:
                 return s_str
             return s_str[0].upper() + s_str[1:].lower() if len(s_str) > 1 else s_str.upper()
         
+        customer_regions = sorted([
+            to_title_case(val)
+            for val in self.collection.distinct('customer_region')
+            if val
+        ])
+        
+        genders = sorted([
+            to_title_case(val)
+            for val in self.collection.distinct('gender')
+            if val
+        ])
+        
+        product_categories = sorted([
+            to_title_case(val)
+            for val in self.collection.distinct('product_category')
+            if val
+        ])
+        
+        payment_methods = sorted([
+            to_title_case(val)
+            for val in self.collection.distinct('payment_method')
+            if val
+        ])
+        
+        tags_set = set()
+        pipeline = [
+            {'$project': {'tags': 1}},
+            {'$match': {'tags': {'$ne': '', '$exists': True}}}
+        ]
+        for doc in self.collection.aggregate(pipeline):
+            if doc.get('tags'):
+                tag_list = [t.strip() for t in str(doc['tags']).split(',') if t.strip()]
+                tags_set.update(tag_list)
+        
+        tags = sorted([to_title_case(t) for t in tags_set])
+        
         return {
-            "customer_regions": [to_title_case(r) for r in customer_regions],
-            "genders": [to_title_case(g) for g in genders],
-            "product_categories": [to_title_case(c) for c in product_categories],
-            "payment_methods": [to_title_case(p) for p in payment_methods],
-            "tags": sorted([to_title_case(t) for t in all_tags])
+            "customer_regions": customer_regions,
+            "genders": genders,
+            "product_categories": product_categories,
+            "payment_methods": payment_methods,
+            "tags": tags
         }
